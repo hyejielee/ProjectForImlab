@@ -19,7 +19,8 @@ CGPROGRAM
 
 #include "GaussianSplatting.hlsl"
 
-StructuredBuffer<uint> _OrderBuffer;
+//HJ
+StructuredBuffer<uint> _SplatSortKeys;
 
 struct v2f
 {
@@ -37,12 +38,10 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
     v2f o = (v2f)0;
 
 	//HJ
-    //instID = _OrderBuffer[instID];
-	//SplatViewData view = _SplatViewData[instID];
 	uint sortedIdx = instID;
-    uint origIdx = _OrderBuffer[sortedIdx];
-
+    uint origIdx = _SplatSortKeys[sortedIdx];
     SplatViewData view = _SplatViewData[sortedIdx];
+
 	//
 
 	float4 centerClipPos = view.pos;

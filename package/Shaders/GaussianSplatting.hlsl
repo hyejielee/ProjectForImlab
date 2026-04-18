@@ -207,6 +207,26 @@ uint _SplatChunkCount;
 
 static const uint kChunkSize = 256;
 
+//HJ
+struct SplatCustom
+{
+    float3 posDelta;
+    float4 rot;
+    float3 scale;
+    float opacity;
+    float pad;
+};
+
+#ifdef SHADER_STAGE_COMPUTE
+RWStructuredBuffer<SplatCustom> _GSBuffer;
+#else
+StructuredBuffer<SplatCustom> _GSBuffer;
+#endif
+
+uint _UseFrameData;
+//
+
+
 struct SplatData
 {
     float3 pos;
@@ -409,6 +429,10 @@ float3 LoadSplatPosValue(uint index)
 
 float3 LoadSplatPos(uint idx)
 {
+    //HJ
+    if (_UseFrameData != 0)
+        return _GSBuffer[idx].posDelta;
+
     float3 pos = LoadSplatPosValue(idx);
     uint chunkIdx = idx / kChunkSize;
     if (chunkIdx < _SplatChunkCount)
@@ -418,6 +442,7 @@ float3 LoadSplatPos(uint idx)
         float3 posMax = float3(chunk.posX.y, chunk.posY.y, chunk.posZ.y);
         pos = lerp(posMin, posMax, pos);
     }
+
     return pos;
 }
 
@@ -432,6 +457,55 @@ SplatData LoadSplatData(uint idx)
 
     // figure out raw data offsets / locations
     uint3 coord = SplatIndexToPixelIndex(idx);
+
+    //HJ
+    if (_UseFrameData != 0)
+    {
+        half4 col = LoadSplatColTex(coord);
+        uint shOffset = idx * 192;
+        uint4 shRaw0 = _SplatSH.Load4(shOffset);
+        uint4 shRaw1 = _SplatSH.Load4(shOffset + 16);
+        uint4 shRaw2 = _SplatSH.Load4(shOffset + 32);
+        uint4 shRaw3 = _SplatSH.Load4(shOffset + 48);
+        uint4 shRaw4 = _SplatSH.Load4(shOffset + 64);
+        uint4 shRaw5 = _SplatSH.Load4(shOffset + 80);
+        uint4 shRaw6 = _SplatSH.Load4(shOffset + 96);
+        uint4 shRaw7 = _SplatSH.Load4(shOffset + 112);
+        uint4 shRaw8 = _SplatSH.Load4(shOffset + 128);
+        uint4 shRaw9 = _SplatSH.Load4(shOffset + 144);
+        uint4 shRawA = _SplatSH.Load4(shOffset + 160);
+        uint  shRawB = _SplatSH.Load(shOffset + 176);
+
+        s.sh.sh1.r  = asfloat(shRaw0.x); s.sh.sh1.g =  asfloat(shRaw0.y); s.sh.sh1.b =  asfloat(shRaw0.z);
+        s.sh.sh2.r  = asfloat(shRaw0.w); s.sh.sh2.g =  asfloat(shRaw1.x); s.sh.sh2.b =  asfloat(shRaw1.y);
+        s.sh.sh3.r  = asfloat(shRaw1.z); s.sh.sh3.g =  asfloat(shRaw1.w); s.sh.sh3.b =  asfloat(shRaw2.x);
+        s.sh.sh4.r  = asfloat(shRaw2.y); s.sh.sh4.g =  asfloat(shRaw2.z); s.sh.sh4.b =  asfloat(shRaw2.w);
+        s.sh.sh5.r  = asfloat(shRaw3.x); s.sh.sh5.g =  asfloat(shRaw3.y); s.sh.sh5.b =  asfloat(shRaw3.z);
+        s.sh.sh6.r  = asfloat(shRaw3.w); s.sh.sh6.g =  asfloat(shRaw4.x); s.sh.sh6.b =  asfloat(shRaw4.y);
+        s.sh.sh7.r  = asfloat(shRaw4.z); s.sh.sh7.g =  asfloat(shRaw4.w); s.sh.sh7.b =  asfloat(shRaw5.x);
+        s.sh.sh8.r  = asfloat(shRaw5.y); s.sh.sh8.g =  asfloat(shRaw5.z); s.sh.sh8.b =  asfloat(shRaw5.w);
+        s.sh.sh9.r  = asfloat(shRaw6.x); s.sh.sh9.g =  asfloat(shRaw6.y); s.sh.sh9.b =  asfloat(shRaw6.z);
+        s.sh.sh10.r = asfloat(shRaw6.w); s.sh.sh10.g = asfloat(shRaw7.x); s.sh.sh10.b = asfloat(shRaw7.y);
+        s.sh.sh11.r = asfloat(shRaw7.z); s.sh.sh11.g = asfloat(shRaw7.w); s.sh.sh11.b = asfloat(shRaw8.x);
+        s.sh.sh12.r = asfloat(shRaw8.y); s.sh.sh12.g = asfloat(shRaw8.z); s.sh.sh12.b = asfloat(shRaw8.w);
+        s.sh.sh13.r = asfloat(shRaw9.x); s.sh.sh13.g = asfloat(shRaw9.y); s.sh.sh13.b = asfloat(shRaw9.z);
+        s.sh.sh14.r = asfloat(shRaw9.w); s.sh.sh14.g = asfloat(shRawA.x); s.sh.sh14.b = asfloat(shRawA.y);
+        s.sh.sh15.r = asfloat(shRawA.z); s.sh.sh15.g = asfloat(shRawA.w); s.sh.sh15.b = asfloat(shRawB);
+
+        SplatCustom frame = _GSBuffer[idx];
+        float4 q = frame.rot;
+        if (dot(q, q) < 1e-8)
+            q = float4(0, 0, 0, 1);
+        else
+            q = normalize(q);
+
+        s.pos = frame.posDelta;
+        s.rot = q;
+        s.scale = exp(frame.scale);
+        s.opacity = 1.0 / (1.0 + exp(-frame.opacity));
+        s.sh.col = col.rgb;
+        return s;
+    }
 
     uint scaleFmt = (_SplatFormat >> 8) & 0xFF;
     uint shFormat = (_SplatFormat >> 16) & 0xFF;
@@ -459,8 +533,6 @@ SplatData LoadSplatData(uint idx)
     else if (shFormat == VECTOR_FMT_6)
         shStride = 32; // 15x ushort, rounded up to multiple of 4
 
-
-    // load raw splat data, which might be chunk-relative
     s.pos       = LoadSplatPosValue(idx);
     s.rot       = DecodeRotation(DecodePacked_10_10_10_2(LoadUInt(_SplatOther, otherAddr)));
     s.scale     = LoadAndDecodeVector(_SplatOther, otherAddr + 4, scaleFmt);
@@ -602,8 +674,9 @@ SplatData LoadSplatData(uint idx)
             s.sh.sh15   = lerp(shMin, shMax, s.sh.sh15);
         }
     }
-    s.opacity   = col.a;
-    s.sh.col    = col.rgb;
+
+    s.opacity = col.a;
+    s.sh.col = col.rgb;
 
     return s;
 }

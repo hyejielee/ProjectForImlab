@@ -65,6 +65,11 @@ namespace GaussianSplatting.Editor.Utils
                 }
 
                 splats = PLYDataToSplats(plyRawData, splatCount, vertexStride, attributes);
+                for (int i = 0; i < Mathf.Min(3, splats.Length); i++)
+                {
+                    var s = splats[i];
+                    Debug.Log($"RAW[{i}] vid={s.vertex_id} pos={s.pos} scale={s.scale} rot={s.rot} opacity={s.opacity} dc0={s.dc0}");
+                }
                 //HJ
                 var list = new List<InputSplatData>(splats.Length);
 
@@ -76,6 +81,12 @@ namespace GaussianSplatting.Editor.Utils
                 for (int i = 0; i < splats.Length; i++)
                     splats[i] = list[i];
 
+                for (int i = 0; i < Mathf.Min(3, splats.Length); i++)
+                {
+                    var s = splats[i];
+                    Debug.Log($"SORTED[{i}] vid={s.vertex_id} pos={s.pos} scale={s.scale} rot={s.rot} opacity={s.opacity} dc0={s.dc0}");
+                }
+
                 for (int i = 0; i < splats.Length; i++)
                 {
                     if (splats[i].vertex_id != i)
@@ -85,7 +96,18 @@ namespace GaussianSplatting.Editor.Utils
 
                 ReorderSHs(splatCount, (float*)splats.GetUnsafePtr(), shCoeffCount);
 
+                for (int i = 0; i < Mathf.Min(3, splats.Length); i++)
+                {
+                    var s = splats[i];
+                    Debug.Log($"AFTER_REORDER_SH[{i}] vid={s.vertex_id} pos={s.pos} scale={s.scale} rot={s.rot} opacity={s.opacity} dc0={s.dc0} sh1={s.sh1} sh2={s.sh2}");
+                }
+
                 LinearizeData(splats);
+                for (int i = 0; i < Mathf.Min(3, splats.Length); i++)
+                {
+                    var s = splats[i];
+                    Debug.Log($"AFTER_LINEARIZE[{i}] vid={s.vertex_id} pos={s.pos} scale={s.scale} rot={s.rot} opacity={s.opacity} dc0={s.dc0}");
+                }
 
                 Debug.Log($"[PLY] detected SH coeff count = {shCoeffCount}, f_rest count = {shCoeffCount * 3}, shOrder = {(shCoeffCount == 8 ? 2 : 3)}");
 

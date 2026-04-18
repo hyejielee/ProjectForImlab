@@ -5,7 +5,7 @@ using UnityEngine;
 public static class hj_read_bin_float32
 {
     public const uint MAGIC = 0x54505347; // "GSPT"
-    public const uint VERSION = 1;
+    public const uint VERSION = 2;
 
     const uint F_XYZ   = 1u << 0;
     const uint F_ROT   = 1u << 1;
@@ -48,6 +48,7 @@ public static class hj_read_bin_float32
 
         public int[] indices;          // [K]
         public Vector3[] xyzDelta;     // [K]
+        public int[] mapping;          // [N] current -> previous frame row
 
         public Vector3[] fdc;          // [N]
         public float[] frest;          // [N * frestDim] flat
@@ -55,22 +56,6 @@ public static class hj_read_bin_float32
         public Vector3[] scale;        // [N]
         public Quaternion[] rot;       // [N]
         public float[] opacity;        // [N]
-
-        public float GetFrest(int gaussianIndex, int coeffIndex)
-        {
-            if (frest == null)
-                throw new InvalidOperationException("frest is null.");
-
-            int dim = header.frestDim;
-
-            if (gaussianIndex < 0 || gaussianIndex >= header.N)
-                throw new ArgumentOutOfRangeException(nameof(gaussianIndex));
-
-            if (coeffIndex < 0 || coeffIndex >= dim)
-                throw new ArgumentOutOfRangeException(nameof(coeffIndex));
-
-            return frest[gaussianIndex * dim + coeffIndex];
-        }
     }
 
     public static FrameData Read(string path)
@@ -88,10 +73,11 @@ public static class hj_read_bin_float32
 
             Debug.Log($"[BIN] {h}");
 
-            // fixed order:
+            // fixed order (v2):
             // header
             // xyz indices[K] int32
             // xyz delta[K,3] float32
+            // current->prev mapping[N] int32
             // f_dc[N,3] float32
             // f_rest[N,frestDim] float32
             // sc[N,3] float32
@@ -100,6 +86,7 @@ public static class hj_read_bin_float32
 
             data.indices = ReadInt32Array(br, h.K);
             data.xyzDelta = ReadVector3Array(br, h.K);
+            data.mapping = ReadInt32Array(br, h.N);
 
             data.fdc = ReadVector3Array(br, h.N);
             data.frest = ReadFloatArray(br, checked(h.N * h.frestDim));
@@ -144,7 +131,7 @@ public static class hj_read_bin_float32
             throw new InvalidDataException($"Magic mismatch: got 0x{h.magic:X8}, expected 0x{MAGIC:X8}");
 
         if (h.version != VERSION)
-            throw new InvalidDataException($"Version mismatch: got {h.version}, expected {VERSION}");
+            throw new InvalidDataException($"Unsupported version: {h.version}");
 
         if (h.flags != REQUIRED_FLAGS)
             throw new InvalidDataException($"Flags mismatch: got {h.flags}, expected {REQUIRED_FLAGS}");

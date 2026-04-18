@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// SH 계수 반영 수정사항  - OOO
+﻿// SPDX-License-Identifier: MIT
+// SH
 using System;
 using System.IO; 
 using GaussianSplatting.Runtime; 
@@ -143,19 +143,14 @@ namespace GaussianSplatting.Runtime
                 mpb.SetBuffer(GaussianSplatRenderer.Props.SplatChunks, gs.m_GpuChunks);
 
                 mpb.SetBuffer(GaussianSplatRenderer.Props.SplatViewData, gs.m_GpuView);
-
-
-                //HJ //나라는 버퍼가 있음을 알림.
-                mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, gs.m_GpuOrderBuffer);
+                
+                mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, gs.m_GpuSortKeys);
+                mpb.SetBuffer(GaussianSplatRenderer.Props.SplatSortKeys, gs.m_GpuSortKeys);
                 mpb.SetBuffer("_GSBuffer", gs.GpuGSBuffer);
-                //mpb.SetBuffer(GaussianSplatRenderer.Props.OrderBuffer, gs.m_GpuSortKeys);
-                //
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatScale, gs.m_SplatScale);
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatOpacityScale, gs.m_OpacityScale);
                 mpb.SetFloat(GaussianSplatRenderer.Props.SplatSize, gs.m_PointDisplaySize);
-                //HJ
                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOrder, gs.m_SHOrder);
-                //
                 mpb.SetInteger(GaussianSplatRenderer.Props.SHOnly, gs.m_SHOnly ? 1 : 0);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayIndex, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugPointIndices ? 1 : 0);
                 mpb.SetInteger(GaussianSplatRenderer.Props.DisplayChunks, gs.m_RenderMode == GaussianSplatRenderer.RenderMode.DebugChunkBounds ? 1 : 0);
@@ -236,8 +231,8 @@ namespace GaussianSplatting.Runtime
             DebugChunkBounds,
         }
         public GaussianSplatAsset m_Asset;
-        
-        //SJ
+
+        //HJ
         [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit, Size = 48)]
 
         public struct SplatCustom
@@ -248,6 +243,7 @@ namespace GaussianSplatting.Runtime
             [FieldOffset(40)] public float opacity;  // 4 bytes
             [FieldOffset(44)] public float pad;           // 4 bytes
         }    
+        //
 
         [Tooltip("Rendering order compared to other splats. Within same order splats are sorted by distance. Higher order splats render 'on top of' lower order splats.")]
         public int m_RenderOrder;
@@ -276,7 +272,12 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Gaussian splatting compute shader")]
         public ComputeShader m_CSSplatUtilities;
 
-        int m_SplatCount; // initially same as asset splat count, but editing can change this
+        int m_SplatCount; // buffer capacity; initially same as asset splat count
+        //HJ
+        int m_BaseSplatCount;
+        int m_ActiveSplatCount;
+        int m_FrameBufferCapacity;
+        //
         GraphicsBuffer m_GpuSortDistances;
         internal GraphicsBuffer m_GpuSortKeys;
         GraphicsBuffer m_GpuPosData;
@@ -298,123 +299,282 @@ namespace GaussianSplatting.Runtime
         GraphicsBuffer m_GpuEditPosMouseDown; // position state at start of operation
         GraphicsBuffer m_GpuEditOtherMouseDown; // rotation/scale state at start of operation
         
-
         //HJ
         GraphicsBuffer m_GpuGSBuffer;
-        internal GraphicsBuffer GpuGSBuffer => m_GpuGSBuffer; 
-        internal GraphicsBuffer m_GpuOrderBuffer;
+        internal GraphicsBuffer GpuGSBuffer => m_GpuGSBuffer;
+        GraphicsBuffer m_GpuFrameSHData;
 
-        GraphicsBuffer m_GpuDeltaIndices;
-        GraphicsBuffer m_GpuDeltaXYZ;
+        Vector3[] m_BaseFramePositions;
+        Vector3[] m_RuntimePrevPositions;
+        int m_RuntimePrevCount;
 
-        GraphicsBuffer m_GpuFrameRot; //각 버퍼에 미리 담고 .compute에서 합쳐서 담을 겁니다.
-        GraphicsBuffer m_GpuFrameScale;
-        GraphicsBuffer m_GpuFrameOpacity;
-        
-        int[] m_TmpIndices;
-        Vector3[] m_TmpDeltaXYZ;
-        Quaternion[] m_TmpRot;
-        Vector3[] m_TmpScale;
-        float[] m_TmpOpacity;
-
-        //OOO
         Texture2D m_GpuColorDataTex;
+        Texture2D m_GpuFrameColorDataTex;
         ushort[] m_TmpColorHalf;
         uint[] m_TmpPackedSH;
         float[] m_TmpColorFloat;
-        
-        //수정 가능
+
         const int kFrameFdcDim = 3;
         const int kFrameFRestDim = 24;
-        //
-        
-        int m_LastDeltaK = 0;
-        internal int LastDeltaK => m_LastDeltaK;
+
         int m_DeltaFrame = 1;
-        internal int DeltaFrame => m_DeltaFrame;
-
-        public string deltaRoot = @"C:\GS_Project\Queen_pretrain\Packets";
-
-        int m_LastLoadedDeltaFrame = -1;
+        public string deltaRoot = @"Queen_pretrain\packet";
+        
         int m_LastAppliedDeltaFrame = -1;
-        int m_KernelApplyDelta = -1;
-        int m_KernelApplyDense = -1;
-
         
-        int KernelApplyDelta()
+        //For CPU
+        void CacheBaseFramePositions()
         {
-            if (m_KernelApplyDelta < 0){
-                m_KernelApplyDelta = m_CSSplatUtilities.FindKernel("CSApplyIncrementalDeltaSparse");
-            }
-            return m_KernelApplyDelta;
+            if (m_BaseFramePositions != null && m_BaseFramePositions.Length == m_BaseSplatCount)
+                return;
+
+            m_BaseFramePositions = new Vector3[m_BaseSplatCount];
+            for (int i = 0; i < m_BaseSplatCount; i++)
+                m_BaseFramePositions[i] = GetAssetPosAtCPU(i);
         }
 
-        
-        int KernelApplyDense()
+        Vector3 GetAssetPosAtCPU(int idx)
         {
-            if (m_KernelApplyDense < 0)
+            if (m_Asset == null || m_Asset.posData == null || idx < 0 || idx >= m_BaseSplatCount)
+                return Vector3.zero;
+
+            var posBytes = m_Asset.posData.GetData<byte>();
+            int stride = GaussianSplatAsset.GetVectorSize(m_Asset.posFormat);
+            int baseOffset = idx * stride;
+            if (baseOffset < 0 || baseOffset + stride > posBytes.Length)
+                return Vector3.zero;
+
+            Vector3 pos = m_Asset.posFormat switch
             {
-                m_KernelApplyDense = m_CSSplatUtilities.FindKernel("CSApplyDenseAttributes");
-            }
-            return m_KernelApplyDense;
+                GaussianSplatAsset.VectorFormat.Float32 => new Vector3(
+                    ReadFloat32(posBytes, baseOffset + 0),
+                    ReadFloat32(posBytes, baseOffset + 4),
+                    ReadFloat32(posBytes, baseOffset + 8)),
+                GaussianSplatAsset.VectorFormat.Norm16 => new Vector3(
+                    ReadUInt16(posBytes, baseOffset + 0) / 65535.0f,
+                    ReadUInt16(posBytes, baseOffset + 2) / 65535.0f,
+                    ReadUInt16(posBytes, baseOffset + 4) / 65535.0f),
+                GaussianSplatAsset.VectorFormat.Norm11 => DecodeNorm11(ReadUInt32(posBytes, baseOffset)),
+                GaussianSplatAsset.VectorFormat.Norm6 => DecodeNorm655(ReadUInt16(posBytes, baseOffset)),
+                _ => Vector3.zero
+            };
+
+            if (m_Asset.chunkData == null)
+                return pos;
+
+            var chunks = m_Asset.chunkData.GetData<GaussianSplatAsset.ChunkInfo>();
+            int chunkIndex = idx / GaussianSplatAsset.kChunkSize;
+            if (chunkIndex < 0 || chunkIndex >= chunks.Length)
+                return pos;
+
+            var chunk = chunks[chunkIndex];
+            Vector3 posMin = new(chunk.posX.x, chunk.posY.x, chunk.posZ.x);
+            Vector3 posMax = new(chunk.posX.y, chunk.posY.y, chunk.posZ.y);
+            return new Vector3(
+                Mathf.Lerp(posMin.x, posMax.x, pos.x),
+                Mathf.Lerp(posMin.y, posMax.y, pos.y),
+                Mathf.Lerp(posMin.z, posMax.z, pos.z));
+        }
+
+        static ushort ReadUInt16(NativeArray<byte> data, int offset)
+        {
+            return (ushort)(data[offset] | (data[offset + 1] << 8));
+        }
+
+        static uint ReadUInt32(NativeArray<byte> data, int offset)
+        {
+            return (uint)(data[offset]
+                | (data[offset + 1] << 8)
+                | (data[offset + 2] << 16)
+                | (data[offset + 3] << 24));
+        }
+
+        static float ReadFloat32(NativeArray<byte> data, int offset)
+        {
+            return math.asfloat((int)ReadUInt32(data, offset));
+        }
+
+        static Vector3 DecodeNorm11(uint packed)
+        {
+            float x = (packed & 0x7FF) / 2047.0f;
+            float y = ((packed >> 11) & 0x3FF) / 1023.0f;
+            float z = ((packed >> 21) & 0x7FF) / 2047.0f;
+            return new Vector3(x, y, z);
+        }
+
+        static Vector3 DecodeNorm655(ushort packed)
+        {
+            float x = (packed & 0x3F) / 63.0f;
+            float y = ((packed >> 6) & 0x1F) / 31.0f;
+            float z = ((packed >> 11) & 0x1F) / 31.0f;
+            return new Vector3(x, y, z);
         }
         
-
-        void ApplyDeltaSparseOnceOnGPU(int frameNumber)
+        void EnsureFrameCapacity(int requiredCount)
         {
-            if (m_LastLoadedDeltaFrame != frameNumber) return;
-            if (m_LastAppliedDeltaFrame == frameNumber) return;
+            requiredCount = math.max(requiredCount, m_BaseSplatCount);
+            if (requiredCount <= 0)
+                return;
 
-            int K = m_LastDeltaK;
-            if (K <= 0)
+            if (m_FrameBufferCapacity >= requiredCount &&
+                m_GpuFrameSHData != null &&
+                m_GpuFrameColorDataTex != null &&
+                m_GpuView != null &&
+                m_GpuView.count >= requiredCount)
             {
                 return;
             }
 
-            int kernel = KernelApplyDelta();
+            m_FrameBufferCapacity = requiredCount;
+            m_SplatCount = requiredCount;
 
-            using var cmb = new CommandBuffer { name = $"ApplyDeltaSparseOnce f{frameNumber}" };
+            DisposeBuffer(ref m_GpuFrameSHData);
+            DisposeBuffer(ref m_GpuGSBuffer);
+            DisposeBuffer(ref m_GpuView);
+            DestroyImmediate(m_GpuFrameColorDataTex);
 
-            cmb.SetComputeBufferParam(m_CSSplatUtilities, kernel, "_GSBuffer", m_GpuGSBuffer);
-            cmb.SetComputeBufferParam(m_CSSplatUtilities, kernel, "_DeltaIndices", m_GpuDeltaIndices);
-            cmb.SetComputeBufferParam(m_CSSplatUtilities, kernel, "_DeltaXYZ", m_GpuDeltaXYZ);
-            cmb.SetComputeIntParam(m_CSSplatUtilities, "_K", K);
-            cmb.SetComputeIntParam(m_CSSplatUtilities, "_SplatCount", m_SplatCount);
+            m_GpuFrameSHData = new GraphicsBuffer(GraphicsBuffer.Target.Raw, m_FrameBufferCapacity * 48, 4)
+            { name = "FrameSHData" };
+            m_GpuGSBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_FrameBufferCapacity, 48)
+            { name = "GpuGSBuffer" };
 
-            m_CSSplatUtilities.GetKernelThreadGroupSizes(kernel, out uint tgx, out _, out _);
-            int groups = (K + (int)tgx - 1) / (int)tgx;
+            var zeroState = new SplatCustom[m_FrameBufferCapacity];
+            for (int i = 0; i < m_FrameBufferCapacity; i++)
+            {
+                zeroState[i].posDelta = Vector3.zero;
+                zeroState[i].rot = new Quaternion(0f, 0f, 0f, 1f);
+                zeroState[i].scale = Vector3.zero;
+                zeroState[i].opacity = 0f;
+                zeroState[i].pad = 0f;
+            }
+            m_GpuGSBuffer.SetData(zeroState);
 
-            cmb.DispatchCompute(m_CSSplatUtilities, kernel, groups, 1, 1);
-            Graphics.ExecuteCommandBuffer(cmb);
+            var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(m_FrameBufferCapacity);
+            var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
+            m_GpuFrameColorDataTex = new Texture2D(
+                texWidth, texHeight, texFormat,
+                TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate)
+            { name = "FrameColorData" };
+            m_GpuFrameColorDataTex.Apply(false, false);
 
-            m_LastDeltaK = 0; 
+            m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_FrameBufferCapacity, kGpuViewDataSize);
+            InitSortBuffers(m_FrameBufferCapacity);
         }
 
-        
-        void ApplyDenseAttributesOnceOnGPU(int frameNumber)
+        Vector3[] ReconstructFramePositions(hj_read_bin_float32.FrameData frame)
         {
-            int kernel = KernelApplyDense();
+            int currentCount = frame.header.N;
+            int[] mapping = frame.mapping;
+            if (mapping == null || mapping.Length == 0)
+            {
+                mapping = new int[currentCount];
+                for (int i = 0; i < currentCount; i++)
+                    mapping[i] = i;
+            }
 
-            using var cmb = new CommandBuffer { name = $"ApplyDenseAttributes f{frameNumber}" };
+            if (mapping.Length != currentCount)
+                throw new InvalidDataException($"Frame mapping length mismatch. mapping={mapping.Length}, current={currentCount}");
 
-            cmb.SetComputeBufferParam(m_CSSplatUtilities, kernel, "_GSBuffer", m_GpuGSBuffer);
+            if (m_RuntimePrevPositions == null || m_RuntimePrevCount <= 0)
+            {
+                CacheBaseFramePositions();
+                m_RuntimePrevPositions = (Vector3[])m_BaseFramePositions.Clone();
+                m_RuntimePrevCount = m_BaseFramePositions.Length;
+            }
 
-            cmb.SetComputeBufferParam(m_CSSplatUtilities, kernel, "_FrameRot", m_GpuFrameRot);
-            cmb.SetComputeBufferParam(m_CSSplatUtilities, kernel, "_FrameScale", m_GpuFrameScale);
-            cmb.SetComputeBufferParam(m_CSSplatUtilities, kernel, "_FrameOpacity", m_GpuFrameOpacity);
-            
-            cmb.SetComputeIntParam(m_CSSplatUtilities, "_SplatCount", m_SplatCount);
+            var currentPositions = new Vector3[currentCount];
+            for (int i = 0; i < currentCount; i++)
+            {
+                int prevIdx = mapping[i];
+                if (prevIdx < 0 || prevIdx >= m_RuntimePrevCount)
+                    throw new InvalidDataException($"Frame mapping out of range at row {i}. prevIdx={prevIdx}, prevCount={m_RuntimePrevCount}");
+                currentPositions[i] = m_RuntimePrevPositions[prevIdx];
+            }
 
-            m_CSSplatUtilities.GetKernelThreadGroupSizes(kernel, out uint tgx, out _, out _);
-            int groups = (m_SplatCount + (int)tgx - 1) / (int)tgx;
+            int K = frame.indices != null ? frame.indices.Length : 0;
+            for (int i = 0; i < K; i++)
+            {
+                int idx = frame.indices[i];
+                if (idx < 0 || idx >= currentCount)
+                    continue;
+                currentPositions[idx] += frame.xyzDelta[i];
+            }
 
-            cmb.DispatchCompute(m_CSSplatUtilities, kernel, groups, 1, 1);
-            Graphics.ExecuteCommandBuffer(cmb);
+            return currentPositions;
+        }
 
+       //initialize
+        void ResetFramePlaybackState(bool resetFrameCursor)
+        {
+            m_LastAppliedDeltaFrame = -1;
+
+            if (resetFrameCursor)
+                m_DeltaFrame = 1;
+
+            m_ActiveSplatCount = m_BaseSplatCount;
+
+            if (m_GpuGSBuffer != null && m_FrameBufferCapacity > 0)
+            {
+                var zeroState = new SplatCustom[m_FrameBufferCapacity];
+                for (int i = 0; i < m_FrameBufferCapacity; i++)
+                {
+                    zeroState[i].posDelta = Vector3.zero;
+                    zeroState[i].rot = new Quaternion(0f, 0f, 0f, 1f);
+                    zeroState[i].scale = Vector3.zero;
+                    zeroState[i].opacity = 0f;
+                    zeroState[i].pad = 0f;
+                }
+                m_GpuGSBuffer.SetData(zeroState);
+            }
+
+            if (m_BaseFramePositions != null)
+            {
+                m_RuntimePrevPositions = (Vector3[])m_BaseFramePositions.Clone();
+                m_RuntimePrevCount = m_BaseFramePositions.Length;
+            }
+            else
+            {
+                m_RuntimePrevPositions = null;
+                m_RuntimePrevCount = 0;
+            }
+
+            if (m_GpuColorDataTex != null && m_Asset != null && m_Asset.colorData != null)
+            {
+                m_GpuColorDataTex.SetPixelData(m_Asset.colorData.GetData<byte>(), 0);
+                m_GpuColorDataTex.Apply(false, false);
+            }
+
+            if (m_GpuSHData != null && m_Asset != null && m_Asset.shData != null)
+                m_GpuSHData.SetData(m_Asset.shData.GetData<uint>());
+        }
+
+        //jump //a function for future use
+        bool RequiresPlaybackRebuild(int frameNumber)
+        {
+            if (frameNumber < 2)
+                return false;
+
+            if (m_LastAppliedDeltaFrame < 2)
+                return frameNumber != 2;
+
+            return frameNumber != m_LastAppliedDeltaFrame + 1;
+        }
+
+        void RebuildPlaybackStateToFrame(int targetFrame)
+        {
+            ResetFramePlaybackState(false);
+
+            for (int frame = 2; frame <= targetFrame; frame++)
+                ApplyFrameData(frame);
         }
         //
 
-
+        void ApplyFrameData(int frameNumber)
+        {
+            UpdateDeltaFrame(frameNumber);
+            m_LastAppliedDeltaFrame = frameNumber;
+        }
+        //
         GpuSorting m_Sorter;
         GpuSorting.Args m_SorterArgs;
 
@@ -473,9 +633,7 @@ namespace GaussianSplatting.Runtime
             public static readonly int SplatPosMouseDown = Shader.PropertyToID("_SplatPosMouseDown");
             public static readonly int SplatOtherMouseDown = Shader.PropertyToID("_SplatOtherMouseDown");
 
-            //OOO
             public static readonly int UseFrameData = Shader.PropertyToID("_UseFrameData");
-            //
         }
 
         [field: NonSerialized] public bool editModified { get; private set; }
@@ -485,7 +643,7 @@ namespace GaussianSplatting.Runtime
         [field: NonSerialized] public Bounds editSelectedBounds { get; private set; }
 
         public GaussianSplatAsset asset => m_Asset;
-        public int splatCount => m_SplatCount;
+        public int splatCount => m_ActiveSplatCount > 0 ? m_ActiveSplatCount : m_SplatCount;
 
         enum KernelIndices
         {
@@ -542,6 +700,9 @@ namespace GaussianSplatting.Runtime
                 return;
 
             m_SplatCount = asset.splatCount;
+            m_BaseSplatCount = asset.splatCount;
+            m_ActiveSplatCount = asset.splatCount;
+            m_FrameBufferCapacity = asset.splatCount;
 
             m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Raw | GraphicsBuffer.Target.CopySource, (int) (asset.posData.dataSize / 4), 4) { name = "GaussianPosData" };
             m_GpuPosData.SetData(asset.posData.GetData<uint>());
@@ -552,44 +713,14 @@ namespace GaussianSplatting.Runtime
             m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Raw, (int) (asset.shData.dataSize / 4), 4) { name = "GaussianSHData" };
             m_GpuSHData.SetData(asset.shData.GetData<uint>());
             
-            //SJ
-            m_GpuGSBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, 48)
-            { name = "GpuGSBuffer" };
-
-            var initAccum = new SplatCustom[m_SplatCount];
-            for (int i = 0; i < m_SplatCount; i++)
-            {
-                initAccum[i].posDelta = Vector3.zero;
-                initAccum[i].rot = new Quaternion(0f, 0f, 0f, 1f);
-                initAccum[i].scale = Vector3.zero; 
-                initAccum[i].opacity = 0f;           
-                initAccum[i].pad = 0f;
-            }
-            m_GpuGSBuffer.SetData(initAccum);
-            
-
             //HJ
-            m_GpuDeltaIndices = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, 4)
-            { name = "FrameDeltaIndices" };
-            m_GpuDeltaXYZ = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, 12)
-            { name = "FrameDeltaXYZ" };
-            m_GpuFrameRot = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, 16)
-            { name = "FrameRot" };
-            m_GpuFrameScale = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, 12)
-            { name = "FrameScale" };
-            m_GpuFrameOpacity = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_SplatCount, 4)
-            { name = "FrameOpacity" };
-            
+            CacheBaseFramePositions();
             //
 
             var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(asset.splatCount);
             var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
             var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.DontInitializePixels | TextureCreationFlags.IgnoreMipmapLimit | TextureCreationFlags.DontUploadUponCreate) { name = "GaussianColorData" };
             tex.SetPixelData(asset.colorData.GetData<byte>(), 0);
-            
-            //OOO
-            //tex.Apply(false, true);
-            //m_GpuColorData = tex;
             tex.Apply(false, false);
 
             m_GpuColorData = tex;
@@ -597,7 +728,6 @@ namespace GaussianSplatting.Runtime
 
             m_TmpColorHalf = new ushort[texWidth * texHeight * 4];
             m_TmpPackedSH = new uint[m_GpuSHData.count];
-            //
 
             if (asset.chunkData != null && asset.chunkData.dataSize != 0)
             {
@@ -615,7 +745,6 @@ namespace GaussianSplatting.Runtime
                 m_GpuChunksValid = false;
             }
 
-            m_GpuView = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_Asset.splatCount, kGpuViewDataSize);
             m_GpuIndexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, 36, 2);
             // cube indices, most often we use only the first quad
             m_GpuIndexBuffer.SetData(new ushort[]
@@ -628,9 +757,12 @@ namespace GaussianSplatting.Runtime
                 2, 3, 6, 3, 7, 6
             });
 
-            InitSortBuffers(splatCount);
+            EnsureFrameCapacity(m_BaseSplatCount);
+
+            //HJ
+            ResetFramePlaybackState(true);
+            //
         }
- 
 
         void InitSortBuffers(int count)
         {
@@ -640,7 +772,6 @@ namespace GaussianSplatting.Runtime
 
             EnsureSorterAndRegister();
 
-            //HJ
             m_GpuSortDistances = new GraphicsBuffer(
                 GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.CopySource,
                 count, 4) { name = "GaussianSplatSortDistances" };
@@ -648,16 +779,8 @@ namespace GaussianSplatting.Runtime
             m_GpuSortKeys = new GraphicsBuffer(
                 GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.CopySource | GraphicsBuffer.Target.CopyDestination,
                 count, 4) { name = "GaussianSplatSortIndices" };
-
-            m_GpuOrderBuffer = new GraphicsBuffer(
-                GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.CopyDestination | GraphicsBuffer.Target.CopySource,
-                count, 4) { name = "GaussianSplatOrderBuffer" };
-
-            
+   
             int k = K(KernelIndices.SetIndices);
-
-            m_CSSplatUtilities.SetBuffer(k, Props.OrderBuffer, m_GpuOrderBuffer);
-            //
 
             m_CSSplatUtilities.SetBuffer(k, Props.SplatSortKeys, m_GpuSortKeys); 
 
@@ -716,62 +839,51 @@ namespace GaussianSplatting.Runtime
         void SetAssetDataOnCS(CommandBuffer cmb, KernelIndices kernel)
         {
             ComputeShader cs = m_CSSplatUtilities;
-
-            //HJ
+            bool useFrameData = m_LastAppliedDeltaFrame >= 2;
+            GraphicsBuffer shBuffer = useFrameData ? m_GpuFrameSHData : m_GpuSHData;
+            Texture colorTex = useFrameData ? m_GpuFrameColorDataTex : m_GpuColorData;
             int kernelIndex = K(kernel);
-            //
 
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatPos, m_GpuPosData);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatChunks, m_GpuChunks);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatOther, m_GpuOtherData);
-            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatSH, m_GpuSHData);
-            cmb.SetComputeTextureParam(cs, kernelIndex, Props.SplatColor, m_GpuColorData);
+            cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatSH, shBuffer);
+            cmb.SetComputeTextureParam(cs, kernelIndex, Props.SplatColor, colorTex);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatSelectedBits, m_GpuEditSelected ?? m_GpuPosData);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatDeletedBits, m_GpuEditDeleted ?? m_GpuPosData);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatViewData, m_GpuView);
-            
-            //HJ
-            //cmb.SetComputeBufferParam(cs, kernelIndex, Props.OrderBuffer, m_GpuSortKeys);
-            cmb.SetComputeBufferParam(cs, kernelIndex, Props.OrderBuffer, m_GpuOrderBuffer);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatSortKeys, m_GpuSortKeys);
 
             cmb.SetComputeIntParam(cs, Props.SplatBitsValid, m_GpuEditSelected != null && m_GpuEditDeleted != null ? 1 : 0);
 
             uint format = (uint)m_Asset.posFormat | ((uint)m_Asset.scaleFormat << 8) | ((uint)m_Asset.shFormat << 16);
             cmb.SetComputeIntParam(cs, Props.SplatFormat, (int)format);
-            cmb.SetComputeIntParam(cs, Props.SplatCount, m_SplatCount);
+            cmb.SetComputeIntParam(cs, Props.SplatCount, splatCount);
             cmb.SetComputeIntParam(cs, Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
-            //OOO
-            cmb.SetComputeIntParam(cs, Props.UseFrameData, m_LastAppliedDeltaFrame >= 2 ? 1 : 0);
-            //
+            cmb.SetComputeIntParam(cs, Props.UseFrameData, useFrameData ? 1 : 0);
 
             UpdateCutoutsBuffer();
             cmb.SetComputeIntParam(cs, Props.SplatCutoutsCount, m_Cutouts?.Length ?? 0);
             cmb.SetComputeBufferParam(cs, kernelIndex, Props.SplatCutouts, m_GpuEditCutouts);
 
-            //HJ
             cmb.SetComputeBufferParam(cs, kernelIndex, "_GSBuffer", m_GpuGSBuffer);
-
-            cmb.SetComputeBufferParam(cs, kernelIndex, "_FrameRot", m_GpuFrameRot);
-            cmb.SetComputeBufferParam(cs, kernelIndex, "_FrameScale", m_GpuFrameScale);
-            cmb.SetComputeBufferParam(cs, kernelIndex, "_FrameOpacity", m_GpuFrameOpacity);
-            
-
         }
 
         internal void SetAssetDataOnMaterial(MaterialPropertyBlock mat)
         {
+            bool useFrameData = m_LastAppliedDeltaFrame >= 2;
             mat.SetBuffer(Props.SplatPos, m_GpuPosData);
             mat.SetBuffer(Props.SplatOther, m_GpuOtherData);
-            mat.SetBuffer(Props.SplatSH, m_GpuSHData);
-            mat.SetTexture(Props.SplatColor, m_GpuColorData);
+            mat.SetBuffer(Props.SplatSH, useFrameData ? m_GpuFrameSHData : m_GpuSHData);
+            mat.SetTexture(Props.SplatColor, useFrameData ? m_GpuFrameColorDataTex : m_GpuColorData);
             mat.SetBuffer(Props.SplatSelectedBits, m_GpuEditSelected ?? m_GpuPosData);
             mat.SetBuffer(Props.SplatDeletedBits, m_GpuEditDeleted ?? m_GpuPosData);
             mat.SetInt(Props.SplatBitsValid, m_GpuEditSelected != null && m_GpuEditDeleted != null ? 1 : 0);
             uint format = (uint)m_Asset.posFormat | ((uint)m_Asset.scaleFormat << 8) | ((uint)m_Asset.shFormat << 16);
             mat.SetInteger(Props.SplatFormat, (int)format);
-            mat.SetInteger(Props.SplatCount, m_SplatCount);
+            mat.SetInteger(Props.SplatCount, splatCount);
             mat.SetInteger(Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
+            mat.SetInteger(Props.UseFrameData, useFrameData ? 1 : 0);
         }
 
         static void DisposeBuffer(ref GraphicsBuffer buf)
@@ -783,6 +895,7 @@ namespace GaussianSplatting.Runtime
         void DisposeResourcesForAsset()
         {
             DestroyImmediate(m_GpuColorData);
+            DestroyImmediate(m_GpuFrameColorDataTex);
 
             DisposeBuffer(ref m_GpuPosData);
             DisposeBuffer(ref m_GpuOtherData);
@@ -793,10 +906,6 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuIndexBuffer);
             DisposeBuffer(ref m_GpuSortDistances);
             DisposeBuffer(ref m_GpuSortKeys);
-            
-            //HJ
-            DisposeBuffer(ref m_GpuOrderBuffer);
-            //
 
             DisposeBuffer(ref m_GpuEditSelectedMouseDown);
             DisposeBuffer(ref m_GpuEditPosMouseDown);
@@ -806,18 +915,15 @@ namespace GaussianSplatting.Runtime
             DisposeBuffer(ref m_GpuEditCountsBounds);
             DisposeBuffer(ref m_GpuEditCutouts);
             
-            //HJ
             DisposeBuffer(ref m_GpuGSBuffer);
-            DisposeBuffer(ref m_GpuDeltaIndices);
-            DisposeBuffer(ref m_GpuDeltaXYZ);
-            DisposeBuffer(ref m_GpuFrameRot);
-            DisposeBuffer(ref m_GpuFrameScale);
-            DisposeBuffer(ref m_GpuFrameOpacity);
-            //
+            DisposeBuffer(ref m_GpuFrameSHData);
 
             m_SorterArgs.resources.Dispose();
 
             m_SplatCount = 0;
+            m_BaseSplatCount = 0;
+            m_ActiveSplatCount = 0;
+            m_FrameBufferCapacity = 0;
             m_GpuChunksValid = false;
             
             editSelectedSplats = 0;
@@ -825,13 +931,15 @@ namespace GaussianSplatting.Runtime
             editCutSplats = 0;
             editModified = false;
             editSelectedBounds = default;
-
-            //OOO
+            m_LastAppliedDeltaFrame = -1;
             m_GpuColorDataTex = null;
+            m_GpuFrameColorDataTex = null;
             m_TmpColorHalf = null;
             m_TmpPackedSH = null;
             m_TmpColorFloat = null;
-            //
+            m_BaseFramePositions = null;
+            m_RuntimePrevPositions = null;
+            m_RuntimePrevCount = 0;
         }
 
         public void OnDisable()
@@ -873,15 +981,10 @@ namespace GaussianSplatting.Runtime
             cmb.SetComputeVectorParam(m_CSSplatUtilities, Props.VecWorldSpaceCameraPos, camPos);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatScale, m_SplatScale);
             cmb.SetComputeFloatParam(m_CSSplatUtilities, Props.SplatOpacityScale, m_OpacityScale);
-            //HJ
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOrder, m_SHOrder);
-            //
             cmb.SetComputeIntParam(m_CSSplatUtilities, Props.SHOnly, m_SHOnly ? 1 : 0);
-            
-            //SJ
             cmb.SetComputeBufferParam(m_CSSplatUtilities, kernelView, "_SplatSortKeys", m_GpuSortKeys);
             cmb.SetComputeBufferParam(m_CSSplatUtilities, kernelView, "_GSBuffer", m_GpuGSBuffer);
-            //
 
             m_CSSplatUtilities.GetKernelThreadGroupSizes(kernelView, out uint gsX, out _, out _);
 
@@ -895,10 +998,7 @@ namespace GaussianSplatting.Runtime
             if (cam.cameraType == CameraType.Preview)
                 return;
 
-            //HJ
-            int kernelSet = K(KernelIndices.SetIndices);       // CSSetIndices
             int kernelDist = K(KernelIndices.CalcDistances);   // CSCalcDistances
-            //
 
             Matrix4x4 worldToCamMatrix = cam.worldToCameraMatrix;
             worldToCamMatrix.m20 *= -1;
@@ -907,71 +1007,44 @@ namespace GaussianSplatting.Runtime
 
             cmd.BeginSample(s_ProfSort);
 
-            //HJ //(int)KernelIndices.SetIndices = kernelSet
-            cmd.SetComputeBufferParam(m_CSSplatUtilities, kernelSet, Props.SplatSortKeys, m_GpuSortKeys);
-            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, m_SplatCount);
-            cmd.SetComputeBufferParam(m_CSSplatUtilities, kernelSet,Props.OrderBuffer, m_GpuOrderBuffer); 
-
-            m_CSSplatUtilities.GetKernelThreadGroupSizes(kernelSet, out uint gsX0, out _, out _);
-            cmd.DispatchCompute(m_CSSplatUtilities,kernelSet,(m_SplatCount + (int)gsX0 - 1) / (int)gsX0,1, 1);
-            //
-
-            //HJ //(int)KernelIndices.CalcDistances =  kernelDist
             cmd.SetComputeBufferParam(m_CSSplatUtilities, kernelDist, Props.SplatSortDistances, m_GpuSortDistances);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, kernelDist, Props.SplatSortKeys, m_GpuSortKeys);
-            cmd.SetComputeBufferParam(m_CSSplatUtilities, kernelDist, Props.OrderBuffer, m_GpuOrderBuffer); 
 
             cmd.SetComputeBufferParam(m_CSSplatUtilities, kernelDist, Props.SplatChunks, m_GpuChunks);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, kernelDist, Props.SplatPos, m_GpuPosData);
-            //
 
-            //HJ
-            //cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatFormat, (int)m_Asset.posFormat);
-            uint format =
-                (uint)m_Asset.posFormat |
-                ((uint)m_Asset.scaleFormat << 8) |
-                ((uint)m_Asset.shFormat << 16);
-
-            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatFormat, (int)format);
-            //
+            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatFormat, (int)m_Asset.posFormat);
 
             cmd.SetComputeMatrixParam(m_CSSplatUtilities, Props.MatrixMV, worldToCamMatrix * matrix);
-            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, m_SplatCount);
+            cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatCount, splatCount);
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.SplatChunkCount, m_GpuChunksValid ? m_GpuChunks.count : 0);
-            
-            //HJ //OOO
             cmd.SetComputeIntParam(m_CSSplatUtilities, Props.UseFrameData, m_LastAppliedDeltaFrame >= 2 ? 1 : 0);
             cmd.SetComputeBufferParam(m_CSSplatUtilities, kernelDist, "_GSBuffer", m_GpuGSBuffer);
-            //
 
             m_CSSplatUtilities.GetKernelThreadGroupSizes(kernelDist, out uint gsX1, out _, out _);
-            cmd.DispatchCompute(m_CSSplatUtilities,kernelDist,(m_GpuSortDistances.count + (int)gsX1 - 1) / (int)gsX1,1, 1);
+            cmd.DispatchCompute(m_CSSplatUtilities,kernelDist,(splatCount + (int)gsX1 - 1) / (int)gsX1,1, 1);
 
             EnsureSorterAndRegister();
 
             m_SorterArgs.inputKeys = m_GpuSortDistances; // distances are keys
             m_SorterArgs.inputValues = m_GpuSortKeys;    // indices are values
-            m_SorterArgs.count = (uint)m_SplatCount;
+            m_SorterArgs.count = (uint)splatCount;
 
             m_Sorter.Dispatch(cmd, m_SorterArgs);
-            Graphics.CopyBuffer(m_GpuSortKeys, m_GpuOrderBuffer);
-
             cmd.EndSample(s_ProfSort);
         }
 
         public void Update()
         {
-
-            //HJ //추가
             if (!Application.isPlaying)
                 return;
-            //
 
             var curHash = m_Asset ? m_Asset.dataHash : new Hash128();
             if (m_PrevAsset != m_Asset || m_PrevHash != curHash)
             {
                 m_PrevAsset = m_Asset;
                 m_PrevHash = curHash;
+
                 if (resourcesAreSetUp)
                 {
                     DisposeResourcesForAsset();
@@ -982,21 +1055,22 @@ namespace GaussianSplatting.Runtime
                     Debug.LogError($"{nameof(GaussianSplatRenderer)} component is not set up correctly (Resource references are missing), or platform does not support compute shaders");
                 }
             }
-
-
+            
             //HJ
             if (m_DeltaFrame <= 1)
             {
+                if (m_LastAppliedDeltaFrame >= 2)
+                    ResetFramePlaybackState(false);
+
                 m_DeltaFrame++;
                 return;
             }
+            //
 
-            UpdateDeltaFrame(m_DeltaFrame);
-            ApplyDeltaSparseOnceOnGPU(m_DeltaFrame);
-            ApplyDenseAttributesOnceOnGPU(m_DeltaFrame);
-            
-            m_LastAppliedDeltaFrame = m_DeltaFrame;
-
+            if (RequiresPlaybackRebuild(m_DeltaFrame))
+                RebuildPlaybackStateToFrame(m_DeltaFrame);
+            else
+                ApplyFrameData(m_DeltaFrame);
 
             if (m_DeltaFrame < 300)
                 m_DeltaFrame++;
@@ -1448,197 +1522,172 @@ namespace GaussianSplatting.Runtime
             cmb.DispatchCompute(m_CSSplatUtilities, k, (int)((count + gsX - 1) / gsX), 1, 1);
             Graphics.ExecuteCommandBuffer(cmb);
         }
-
-        //HJ
-
+        
         public unsafe void UpdateDeltaFrame(int frameNumber)
         {   
             if (frameNumber <= 1)
             {
                 return;
             }
-            string binPath = Path.Combine(deltaRoot, $"{frameNumber:D4}.bin");
+            string fileName = $"{frameNumber:D4}.bin";
+            string binRoot = deltaRoot;
+            if (!Path.IsPathRooted(binRoot) && !string.IsNullOrEmpty(Application.dataPath))
+            {
+                var dir = Directory.GetParent(Application.dataPath);
+                while (dir != null)
+                {
+                    string candidateRoot = Path.Combine(dir.FullName, deltaRoot);
+                    if (Directory.Exists(candidateRoot))
+                    {
+                        binRoot = candidateRoot;
+                        break;
+                    }
+                    dir = dir.Parent;
+                }
+            }
 
-            //OOO
+            string binPath = Path.Combine(binRoot, fileName);
+            if (!File.Exists(binPath))
+                throw new FileNotFoundException($"Could not find delta bin {fileName} under {binRoot}");
+
             var frame = hj_read_bin_float32.Read(binPath);
             if (frame == null)
                 throw new InvalidOperationException($"Failed to read frame bin: {binPath}");
 
-            if (frame.header.N < m_SplatCount)
-                throw new InvalidDataException($"Frame N too small. bin={frame.header.N}, asset={m_SplatCount}");
-
-            if (frame.header.N != m_SplatCount)
-                Debug.LogWarning($"[BIN] N mismatch. bin={frame.header.N}, asset={m_SplatCount}. Extra tail will be ignored.");
-                
             if (frame.header.fdcDim != kFrameFdcDim)
                 throw new InvalidDataException($"f_dc dim must be {kFrameFdcDim}, got {frame.header.fdcDim}");
 
             if (frame.header.frestDim != kFrameFRestDim)
                 throw new InvalidDataException($"f_rest dim must be {kFrameFRestDim}, got {frame.header.frestDim}");
             
-            m_TmpIndices = frame.indices;
-            m_TmpDeltaXYZ = frame.xyzDelta;
-            m_TmpRot = frame.rot;
-            m_TmpScale = frame.scale;
-            m_TmpOpacity = frame.opacity;
-            //
+            EnsureFrameCapacity(frame.header.N);
+            Vector3[] currentPositions = ReconstructFramePositions(frame);
+            UploadFrameColor(frame.fdc, frame.opacity, frame.header.N);
+            UploadFrameSH(frame.frest, frame.header.N);
 
-            int K = (m_TmpIndices != null) ? m_TmpIndices.Length : 0;
-
-            int validK  = 0; //VALID 한 값들만
-            if (K > 0 && m_TmpDeltaXYZ != null && m_TmpDeltaXYZ.Length == K)
+            var frameState = new SplatCustom[frame.header.N];
+            for (int i = 0; i < frame.header.N; i++)
             {
-                var validI = new List<int>(K);
-                var validD = new List<Vector3>(K);
-
-                for (int i = 0; i < K; i++)
-                {
-                    int idx = m_TmpIndices[i];
-                    if (idx < 0 || idx >= m_SplatCount) continue;
-
-                    validI.Add(idx);
-                    validD.Add(m_TmpDeltaXYZ[i]);
-                }
-
-                validK  = validI.Count;
-    
-                if (validK > 0)
-                {
-                    m_GpuDeltaIndices.SetData(validI, 0, 0, validK);
-                    m_GpuDeltaXYZ.SetData(validD, 0, 0, validK);
-                }
+                frameState[i].posDelta = currentPositions[i];
+                frameState[i].rot = frame.rot[i];
+                frameState[i].scale = frame.scale[i];
+                frameState[i].opacity = frame.opacity[i];
+                frameState[i].pad = 0f;
             }
-
-            m_LastDeltaK = validK;
-            
-            //OOO
-            UploadFrameColor(frame.fdc, frame.opacity);
-            UploadFrameSH(frame.frest);
-            
-
-            var rotVec = new Vector4[m_SplatCount];
-            for (int i = 0; i < m_SplatCount; i++)
-            {
-                Quaternion q = m_TmpRot[i];
-                rotVec[i] = new Vector4(q.x, q.y, q.z, q.w); //이 순서 맞아.
-            }
-            m_GpuFrameRot.SetData(rotVec, 0, 0, m_SplatCount);
-
-            m_GpuFrameScale.SetData(frame.scale, 0, 0, m_SplatCount);
-            m_GpuFrameOpacity.SetData(frame.opacity, 0, 0, m_SplatCount);
-
-            m_LastLoadedDeltaFrame = frameNumber;
-            //
+            m_GpuGSBuffer.SetData(frameState, 0, 0, frame.header.N);
+             
+            m_ActiveSplatCount = frame.header.N;
+            m_RuntimePrevPositions = currentPositions;
+            m_RuntimePrevCount = currentPositions.Length;
         }
 
-            //OOO
-            void UploadFrameColor(Vector3[] fdc, float[] opacity)
+        void UploadFrameColor(Vector3[] fdc, float[] opacity, int count)
+        {
+            if (m_GpuFrameColorDataTex == null)
+                throw new InvalidOperationException("m_GpuFrameColorDataTex is null.");
+
+            if (fdc == null || fdc.Length < count)
+                throw new InvalidDataException($"f_dc length mismatch: {fdc?.Length ?? 0} < {count}");
+
+            if (opacity == null || opacity.Length < count)
+                throw new InvalidDataException($"opacity length mismatch: {opacity?.Length ?? 0} < {count}");
+
+            int texWidth = m_GpuFrameColorDataTex.width;
+            int texHeight = m_GpuFrameColorDataTex.height;
+            int valueCount = texWidth * texHeight * 4;
+
+            // Convert stored SH DC coefficients into the color texture representation used by the renderer.
+            const float kSH0 = 0.2820948f;
+
+            switch (m_GpuFrameColorDataTex.graphicsFormat)
             {
-                if (m_GpuColorDataTex == null)
-                    throw new InvalidOperationException("m_GpuColorDataTex is null.");
-
-                if (fdc == null || fdc.Length < m_SplatCount)
-                    throw new InvalidDataException($"f_dc length mismatch: {fdc?.Length ?? 0} < {m_SplatCount}");
-
-                if (opacity == null || opacity.Length < m_SplatCount)
-                    throw new InvalidDataException($"opacity length mismatch: {opacity?.Length ?? 0} < {m_SplatCount}");
-
-                int texWidth = m_GpuColorDataTex.width;
-                int texHeight = m_GpuColorDataTex.height;
-                int valueCount = texWidth * texHeight * 4;
-
-                // BIN의 f_dc는 SH0 coefficient 이므로 최종 color로 역변환
-                const float kSH0 = 0.2820948f;
-
-                switch (m_GpuColorDataTex.graphicsFormat)
+                case GraphicsFormat.R16G16B16A16_SFloat:
                 {
-                    case GraphicsFormat.R16G16B16A16_SFloat:
+                    if (m_TmpColorHalf == null || m_TmpColorHalf.Length != valueCount)
+                        m_TmpColorHalf = new ushort[valueCount];
+
+                    Array.Clear(m_TmpColorHalf, 0, m_TmpColorHalf.Length);
+
+                    for (int i = 0; i < count; i++)
                     {
-                        if (m_TmpColorHalf == null || m_TmpColorHalf.Length != valueCount)
-                            m_TmpColorHalf = new ushort[valueCount];
+                        SplatIndexToPixelCoord(i, texWidth, out int x, out int y);
+                        int p = (y * texWidth + x) * 4;
 
-                        Array.Clear(m_TmpColorHalf, 0, m_TmpColorHalf.Length);
+                        Vector3 dc = fdc[i];
+                        Vector3 col = dc * kSH0 + new Vector3(0.5f, 0.5f, 0.5f);
 
-                        for (int i = 0; i < m_SplatCount; i++)
-                        {
-                            SplatIndexToPixelCoord(i, texWidth, out int x, out int y);
-                            int p = (y * texWidth + x) * 4;
+                        // Match the renderer's color texture alpha storage to the final opacity value.
+                        float a = 1.0f / (1.0f + Mathf.Exp(-opacity[i]));
+                        a = Mathf.Clamp01(a);
 
-                            Vector3 dc = fdc[i];
-                            Vector3 col = dc * kSH0 + new Vector3(0.5f, 0.5f, 0.5f);
-
-                            // color texture alpha는 "최종 opacity" 쪽이 의미상 맞음
-                            float a = 1.0f / (1.0f + Mathf.Exp(-opacity[i]));
-                            a = Mathf.Clamp01(a);
-
-                            m_TmpColorHalf[p + 0] = Mathf.FloatToHalf(col.x);
-                            m_TmpColorHalf[p + 1] = Mathf.FloatToHalf(col.y);
-                            m_TmpColorHalf[p + 2] = Mathf.FloatToHalf(col.z);
-                            m_TmpColorHalf[p + 3] = Mathf.FloatToHalf(a);
-                        }
-
-                        m_GpuColorDataTex.SetPixelData(m_TmpColorHalf, 0);
-                        break;
+                        m_TmpColorHalf[p + 0] = Mathf.FloatToHalf(col.x);
+                        m_TmpColorHalf[p + 1] = Mathf.FloatToHalf(col.y);
+                        m_TmpColorHalf[p + 2] = Mathf.FloatToHalf(col.z);
+                        m_TmpColorHalf[p + 3] = Mathf.FloatToHalf(a);
                     }
 
-                    case GraphicsFormat.R32G32B32A32_SFloat:
-                    {
-                        if (m_TmpColorFloat == null || m_TmpColorFloat.Length != valueCount)
-                            m_TmpColorFloat = new float[valueCount];
-
-                        Array.Clear(m_TmpColorFloat, 0, m_TmpColorFloat.Length);
-
-                        for (int i = 0; i < m_SplatCount; i++)
-                        {
-                            SplatIndexToPixelCoord(i, texWidth, out int x, out int y);
-                            int p = (y * texWidth + x) * 4;
-
-                            Vector3 dc = fdc[i];
-                            Vector3 col = dc * kSH0 + new Vector3(0.5f, 0.5f, 0.5f);
-
-                            float a = 1.0f / (1.0f + Mathf.Exp(-opacity[i]));
-                            a = Mathf.Clamp01(a);
-
-                            m_TmpColorFloat[p + 0] = col.x;
-                            m_TmpColorFloat[p + 1] = col.y;
-                            m_TmpColorFloat[p + 2] = col.z;
-                            m_TmpColorFloat[p + 3] = a;
-                        }
-
-                        m_GpuColorDataTex.SetPixelData(m_TmpColorFloat, 0);
-                        break;
-                    }
-
-                    case GraphicsFormat.R8G8B8A8_UNorm:
-                    case GraphicsFormat.RGBA_BC7_UNorm:
-                        throw new NotSupportedException(
-                            $"UploadFrameColor does not support runtime upload to {m_GpuColorDataTex.graphicsFormat}. " +
-                            $"Use a runtime Float16x4 or Float32x4 color texture for frame updates.");
-
-                    default:
-                        throw new NotSupportedException(
-                            $"Unsupported color texture format: {m_GpuColorDataTex.graphicsFormat}");
+                    m_GpuFrameColorDataTex.SetPixelData(m_TmpColorHalf, 0);
+                    break;
                 }
 
-                m_GpuColorDataTex.Apply(false, false);
+                case GraphicsFormat.R32G32B32A32_SFloat:
+                {
+                    if (m_TmpColorFloat == null || m_TmpColorFloat.Length != valueCount)
+                        m_TmpColorFloat = new float[valueCount];
+
+                    Array.Clear(m_TmpColorFloat, 0, m_TmpColorFloat.Length);
+
+                    for (int i = 0; i < count; i++)
+                    {
+                        SplatIndexToPixelCoord(i, texWidth, out int x, out int y);
+                        int p = (y * texWidth + x) * 4;
+
+                        Vector3 dc = fdc[i];
+                        Vector3 col = dc * kSH0 + new Vector3(0.5f, 0.5f, 0.5f);
+
+                        float a = 1.0f / (1.0f + Mathf.Exp(-opacity[i]));
+                        a = Mathf.Clamp01(a);
+
+                        m_TmpColorFloat[p + 0] = col.x;
+                        m_TmpColorFloat[p + 1] = col.y;
+                        m_TmpColorFloat[p + 2] = col.z;
+                        m_TmpColorFloat[p + 3] = a;
+                    }
+
+                    m_GpuFrameColorDataTex.SetPixelData(m_TmpColorFloat, 0);
+                    break;
+                }
+
+                case GraphicsFormat.R8G8B8A8_UNorm:
+                case GraphicsFormat.RGBA_BC7_UNorm:
+                    throw new NotSupportedException(
+                        $"UploadFrameColor does not support runtime upload to {m_GpuFrameColorDataTex.graphicsFormat}. " +
+                        $"Use a runtime Float16x4 or Float32x4 color texture for frame updates.");
+
+                default:
+                    throw new NotSupportedException(
+                        $"Unsupported color texture format: {m_GpuFrameColorDataTex.graphicsFormat}");
             }
 
-            void UploadFrameSH(float[] frest)
+            m_GpuFrameColorDataTex.Apply(false, false);
+        }
+
+        void UploadFrameSH(float[] frest, int count)
         {
-            if (frest == null || frest.Length < m_SplatCount * kFrameFRestDim)
+            if (frest == null || frest.Length < count * kFrameFRestDim)
                 throw new InvalidDataException(
-                    $"f_rest length mismatch: {frest?.Length ?? 0} < {m_SplatCount * kFrameFRestDim}");
+                    $"f_rest length mismatch: {frest?.Length ?? 0} < {count * kFrameFRestDim}");
 
             if (asset.shFormat != GaussianSplatAsset.SHFormat.Float32)
                 throw new NotSupportedException(
                     $"Current UploadFrameSH only supports asset.shFormat == Float32, but got {asset.shFormat}");
 
             const int dstStrideU32 = 48; // Float32 SHTableItem: 15 * float3 + padding
-            int requiredU32 = m_SplatCount * dstStrideU32;
+            int requiredU32 = m_FrameBufferCapacity * dstStrideU32;
 
-            if (m_GpuSHData.count != requiredU32)
+            if (m_GpuFrameSHData.count != requiredU32)
                 throw new InvalidDataException(
-                    $"_SplatSH raw size mismatch: gpu={m_GpuSHData.count}, expected={requiredU32}, shFormat={asset.shFormat}");
+                    $"_FrameSH raw size mismatch: gpu={m_GpuFrameSHData.count}, expected={requiredU32}, shFormat={asset.shFormat}");
 
             if (m_TmpPackedSH == null || m_TmpPackedSH.Length != requiredU32)
                 m_TmpPackedSH = new uint[requiredU32];
@@ -1646,7 +1695,7 @@ namespace GaussianSplatting.Runtime
             Array.Clear(m_TmpPackedSH, 0, m_TmpPackedSH.Length);
 
             // BIN frest(24) = [sh1.r, sh1.g, sh1.b, sh2.r, sh2.g, sh2.b, ... , sh8.r, sh8.g, sh8.b]
-            for (int i = 0; i < m_SplatCount; i++)
+            for (int i = 0; i < count; i++)
             {
                 int src = i * kFrameFRestDim;
                 int dst = i * dstStrideU32;
@@ -1668,9 +1717,8 @@ namespace GaussianSplatting.Runtime
                 // sh9 ~ sh15 + padding = 0 유지
             }
 
-            m_GpuSHData.SetData(m_TmpPackedSH, 0, 0, m_TmpPackedSH.Length);
+            m_GpuFrameSHData.SetData(m_TmpPackedSH, 0, 0, m_TmpPackedSH.Length);
         }
-        //
 
         static void SplatIndexToPixelCoord(int splatIndex, int texWidth, out int x, out int y)
         {
@@ -1696,3 +1744,4 @@ namespace GaussianSplatting.Runtime
         }
     }
 }
+
